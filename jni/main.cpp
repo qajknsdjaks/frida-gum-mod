@@ -212,6 +212,7 @@ std::string executeCommand(const std::string& cmd) {
 }
 
 // 解析 ls -l 输出，找到最大的库
+std::vector<LibraryInfo> libraries;
 std::string findLargestLibrary(const std::string& lib_dir) {
     Timer timer("findLargestLibrary");  // ⏱️ 计时开始
     // 执行命令：ls -l | grep -v ^total
@@ -225,7 +226,7 @@ std::string findLargestLibrary(const std::string& lib_dir) {
     
     // LOGI("ls -l 输出:\n%s", output.c_str());
     
-    std::vector<LibraryInfo> libraries;
+    
     std::istringstream stream(output);
     std::string line;
     
@@ -342,6 +343,37 @@ static std::string g_last_json_string;
 
 // libcocos2dcpp.so 基址（用于访问全局变量）
 static GumAddress g_cocos2d_base_addr = 0;
+
+// 🎯 邀请进度写入工具：将 (dword_E2B894 ^ dword_E2B890) 设为指定值，并清空领取位图
+static void forceInviteProgressValue(uint32_t spoof_value) {
+    if (g_cocos2d_base_addr == 0) {
+        LOGE("邀请进度伪造失败：基址未就绪");
+        return;
+    }
+
+    // 全局变量偏移（来自 IDA）
+    uint32_t* invite_key      = reinterpret_cast<uint32_t*>(g_cocos2d_base_addr + 0xE2B890); // dword_E2B890
+    uint32_t* invite_encrypted = reinterpret_cast<uint32_t*>(g_cocos2d_base_addr + 0xE2B894); // dword_E2B894
+    uint32_t* invite_claim_mask = reinterpret_cast<uint32_t*>(g_cocos2d_base_addr + 0xE2B898); // dword_E2B898，领取位图
+
+    if (invite_key && invite_encrypted) {
+        *invite_key = 0;              // 密钥清零
+        *invite_encrypted = spoof_value; // 进度写成超大值
+        LOGI("✅ 已硬编码邀请进度为: %u", spoof_value);
+    } else {
+        LOGE("❌ 邀请进度写入失败：指针为空");
+    }
+
+    if (invite_claim_mask) {
+        *invite_claim_mask = 0; // 清空领取标记，避免被视为已领完
+        LOGI("✅ 已清空邀请领取位图，确保可领取");
+    }
+}
+
+// 便捷接口：写入最大值（满足所有需求）
+static void forceInviteProgressMax() {
+    forceInviteProgressValue(0x7ff);
+}
 
 // 请求缓存结构
 struct CachedRequest {
@@ -734,6 +766,35 @@ static UpdateMoneyFunc original_updateMoney = nullptr;
 // Game_Unpack::updateGold 函数指针 (0x38813c)
 typedef int64_t (*UpdateGoldFunc)(void* this_ptr, int add_value, bool save_to_db);
 static UpdateGoldFunc original_updateGold = nullptr;
+
+// UI_FX::checkMenu (0x4aa9b0) 函数指针
+typedef int64_t* (*CheckMenuFunc)(int64_t* ui_fx_this);
+static CheckMenuFunc original_checkMenu = nullptr;
+
+// UI_FX::initFX (0x4aac04) 函数指针
+typedef void* (*InitFXFunc)(void* ui_fx_this);
+static InitFXFunc original_initFX = nullptr;
+
+// Hook 后的 checkMenu：进入时强制邀请进度满足并清空领取位图
+static int64_t* hooked_checkMenu(int64_t* ui_fx_this) {
+    // 每次菜单检查前强制刷新邀请进度与领取位图
+    forceInviteProgressMax();
+
+    if (original_checkMenu) {
+        return original_checkMenu(ui_fx_this);
+    }
+    return ui_fx_this;
+}
+
+// Hook 后的 initFX：初始化界面时同步伪造邀请进度为 999
+static void* hooked_initFX(void* ui_fx_this) {
+    // 写入固定显示/判定值 999，并清空领取位图
+    forceInviteProgressValue(999);
+    if (original_initFX) {
+        return original_initFX(ui_fx_this);
+    }
+    return ui_fx_this;
+}
 
 // Hook 后的 updateMoney 函数
 static int64_t hooked_updateMoney(void* this_ptr, int add_value, bool save_to_db) {
@@ -1244,6 +1305,41 @@ void hookNetworkFunctions(GumModule* module) {
     // 保存基址到全局变量（供 updateMoney/updateGold 使用）
     g_cocos2d_base_addr = base_addr;
     LOGI("📍 libcocos2dcpp.so 基址: 0x%lx", base_addr);
+
+    // // Hook 3: UI_FX::checkMenu (起始 0x4aa998) — 硬编码邀请进度判定
+    // GumAddress checkMenu_addr = base_addr + 0x4aa998;
+    // LOGI("尝试 Hook UI_FX::checkMenu @ 0x%lx", checkMenu_addr);
+    // gum_interceptor_begin_transaction(interceptor);
+    // GumReplaceReturn ret_check = gum_interceptor_replace_fast(
+    //     interceptor,
+    //     GSIZE_TO_POINTER(checkMenu_addr),
+    //     (gpointer)hooked_checkMenu,
+    //     (gpointer*)&original_checkMenu
+    // );
+    // gum_interceptor_end_transaction(interceptor);
+    // if (ret_check == GUM_REPLACE_OK) {
+    //     LOGI("✅ Hook UI_FX::checkMenu 成功");
+    // } else {
+    //     LOGE("❌ Hook UI_FX::checkMenu 失败: 错误码 %d", ret_check);
+    // }
+
+    // Hook 4: UI_FX::initFX (起始 0x4aac04) — 初始化时将邀请进度写为 999
+    GumAddress initFX_addr = base_addr + 0x4aac04;
+    LOGI("尝试 Hook UI_FX::initFX @ 0x%lx", initFX_addr);
+    gum_interceptor_begin_transaction(interceptor);
+    GumReplaceReturn ret_initfx = gum_interceptor_replace_fast(
+        interceptor,
+        GSIZE_TO_POINTER(initFX_addr),
+        (gpointer)hooked_initFX,
+        (gpointer*)&original_initFX
+    );
+    gum_interceptor_end_transaction(interceptor);
+    if (ret_initfx == GUM_REPLACE_OK) {
+        LOGI("✅ Hook UI_FX::initFX 成功");
+    } else {
+        LOGE("❌ Hook UI_FX::initFX 失败: 错误码 %d", ret_initfx);
+    }
+
     
     GumAddress sendData_addr = base_addr + 0x3b51dc;
     LOGI("尝试 Hook sendData @ 0x%lx (base: 0x%lx + 0x3b51dc)", sendData_addr, base_addr);
@@ -1512,6 +1608,7 @@ static EvalStringFunc original_evalString = nullptr;
 static bool hooked_evalString(void* script_engine, const char* code, int len, void* value, const char* path) {
  
     LOGD("length = %d ,%d", len, ++mycount);
+    
   
     // 执行原始代码
     std::string js(code);
@@ -1772,6 +1869,251 @@ void hookCocosEvalString(GumModule* module) {
     }
 }
 
+// ============================================================================
+// Unity IL2CPP Hook 相关
+// ============================================================================
+
+// il2cpp_resolve_icall 函数指针
+// 用于解析 Unity 内部调用（icall）为原生函数地址
+typedef void* (*il2cpp_resolve_icall_Func)(const char* name);
+static il2cpp_resolve_icall_Func il2cpp_resolve_icall = nullptr;
+
+// UnityEngine.Time::set_timeScale 函数指针
+typedef void (*Unity_SetTimeScale_Func)(float value);
+static Unity_SetTimeScale_Func original_setTimeScale = nullptr;
+
+// Hook 后的 set_timeScale 函数
+static void hooked_setTimeScale(float value) {
+    // 将游戏设置的时间缩放值乘以我们的加速倍数
+    float modified_value = value * 5;
+    LOGI("🎮 Unity Time.timeScale: %.2f -> %.2f (%.1fx 加速)", value, modified_value, g_speed_multiplier);
+    
+    if (original_setTimeScale) {
+        original_setTimeScale(modified_value);
+    }
+}
+
+// Hook Unity Time.timeScale
+void hookUnityTimeScale(GumModule* module) {
+    LOGI("🎮 开始 Hook Unity Time.timeScale...");
+    
+    // 步骤 1：查找 il2cpp_resolve_icall 符号
+    module = gum_process_find_module_by_name("libil2cpp.so");
+    GumAddress resolve_icall_addr = gum_module_find_export_by_name(module, "il2cpp_resolve_icall");
+    
+    if (!resolve_icall_addr) {
+        LOGE("未找到 il2cpp_resolve_icall 导出符号");
+        return;
+    }
+    
+    LOGI("✓ 找到 il2cpp_resolve_icall @ 0x%lx", resolve_icall_addr);
+    il2cpp_resolve_icall = (il2cpp_resolve_icall_Func)resolve_icall_addr;
+    
+    // 步骤 2：通过 il2cpp_resolve_icall 解析 Time.set_timeScale 地址（带重试）
+    void* time_setTimeScale_addr = nullptr;
+  
+    int try_count = 1;
+    
+    LOGI("正在解析 UnityEngine.Time::set_timeScale...");
+    
+    while (time_setTimeScale_addr == nullptr && try_count < 10) {
+        sleep(2);  // 等待 200ms
+        
+        // 尝试解析 icall
+        time_setTimeScale_addr = il2cpp_resolve_icall("UnityEngine.Time::set_timeScale(System.Single)");
+        
+        if (time_setTimeScale_addr == nullptr) {
+            LOGI("等待 IL2CPP 运行时初始化... (%d/10)", try_count++);
+        } else {
+            LOGI("✓ 找到 Time.set_timeScale @ %p (尝试 %d 次)", time_setTimeScale_addr, try_count + 1);
+        }
+    }
+    
+    if (time_setTimeScale_addr == nullptr) {
+        LOGE("解析 Time.set_timeScale 失败，超时");
+        return;
+    }
+    
+    // 步骤 3：Hook Time.set_timeScale
+    original_setTimeScale = (Unity_SetTimeScale_Func)time_setTimeScale_addr;
+    
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    
+    gum_interceptor_begin_transaction(interceptor);
+    GumReplaceReturn ret = gum_interceptor_replace_fast(
+        interceptor,
+        time_setTimeScale_addr,
+        (gpointer)hooked_setTimeScale,
+        (gpointer*)&original_setTimeScale
+    );
+    gum_interceptor_end_transaction(interceptor);
+    
+    if (ret == GUM_REPLACE_OK) {
+        hooked_setTimeScale(1);
+        LOGI("🎯 Unity Time.timeScale Hook 成功 (%.1fx 加速)", g_speed_multiplier);
+    } else {
+        LOGE("❌ Unity Time.timeScale Hook 失败: 错误码 %d", ret);
+    }
+}
+
+// ============================================================================
+// Lua Hook 相关
+// ============================================================================
+
+// luaL_loadbufferx 函数指针
+// int luaL_loadbufferx(lua_State *L, const char *buff, size_t size, const char *name, const char *mode)
+typedef int (*LuaL_loadbufferx_Func)(void* L, const char* buff, size_t size, 
+                                      const char* name, const char* mode);
+static LuaL_loadbufferx_Func original_luaL_loadbufferx = nullptr;
+
+
+
+// Hook 后的 luaL_loadbufferx 函数
+static int hooked_luaL_loadbufferx(void* L, const char* buff, size_t size,
+                                    const char* name, const char* mode) {
+    // 记录 Lua 脚本加载信息
+    LOGI("🔵 luaL_loadbufferx: name=%s, size=%zu, mode=%s", name ? name : "(null)", size, mode ? mode : "(null)");
+
+    // 修改后的 Lua 脚本内容（使用 thread_local 避免多线程问题）
+    thread_local std::string modified_lua;
+    const char* final_buff = buff;
+    size_t final_size = size;
+    bool script_modified = false;
+    
+    if (buff && size > 0) {
+        std::string lua_content(buff, size);
+        
+       
+
+        // 保存 Lua 文件用于调试
+        #ifdef LOG_TAG
+        FILE* file = NULL;
+        
+        // 构造文件路径: /sdcard/Android/data/{pkg}/cache/{count}[{@sanitized_name}].lua
+        std::string lua_filename = std::string("/sdcard/Android/data/") + g_pkg.c_str() + "/cache/";
+        lua_filename.append(std::to_string(++mycount));
+
+        // 当 name 足够长时，附加扁平化的脚本路径，便于区分来源
+        if (name && strlen(name) > 10 && !strstr(name, " ")) {
+            std::string sanitized(name);
+            for (char& ch : sanitized) {
+                if (ch == '/' || ch == '\\') ch = '-';
+            }
+            lua_filename.append(sanitized);
+            if (sanitized.find('.') == std::string::npos) {
+                lua_filename.append(".lua");
+            }
+        } else {
+            lua_filename.append(".lua");
+        }
+        
+        LOGD("保存 Lua: %s", lua_filename.c_str());
+        file = fopen(lua_filename.c_str(), "w+");
+        if (file == NULL) {
+            LOGD("文件创建失败: %s", lua_filename.c_str());
+        } else {
+            // 保存修改后的脚本（如果有修改的话）
+            const char* save_content = script_modified ? modified_lua.c_str() : lua_content.c_str();
+            size_t save_size = script_modified ? modified_lua.length() : lua_content.length();
+            fwrite(save_content, 1, save_size, file);
+            fclose(file);
+            LOGD("Lua 文件保存成功 %s", script_modified ? "(已修改)" : "");
+        }
+        #endif
+    }
+
+    return original_luaL_loadbufferx(L, final_buff, final_size, name, mode);
+}
+
+// Hook Lua 库
+void hookLua(const std::vector<LibraryInfo>& libs) {
+    LOGI("🔵 开始搜索 Lua 库...");
+    
+    std::string lua_lib_name;
+    
+    // 遍历库列表，寻找以 lua.so 结尾的库
+    for (const auto& lib : libs) {
+        // 检查是否以 "lua.so" 结尾
+        const std::string suffix = "lua.so";
+        if (lib.name.length() >= suffix.length() &&
+            lib.name.compare(lib.name.length() - suffix.length(), suffix.length(), suffix) == 0) {
+            LOGI("✓ 发现 Lua 库: %s (大小: %zu 字节)", lib.name.c_str(), lib.size);
+            lua_lib_name = lib.name;
+            break;  // 找到第一个匹配的就停止
+        }
+    }
+    
+    if (lua_lib_name.empty()) {
+        LOGI("未发现以 lua.so 结尾的库，跳过 Lua Hook");
+        return;
+    }
+    
+    // 查找模块（带重试机制，等待模块加载）
+    GumModule* lua_module = nullptr;
+    const int max_retries = 30;  // 最多等待 30 秒
+    int retry_count = 0;
+    
+    while (!lua_module && retry_count < max_retries) {
+        lua_module = gum_process_find_module_by_name(lua_lib_name.c_str());
+        
+        if (!lua_module) {
+            retry_count++;
+            LOGI("Lua 模块 %s 未加载，1 秒后重试 (%d/%d)", 
+                 lua_lib_name.c_str(), retry_count, max_retries);
+            sleep(1);  // 等待 1 秒
+        }
+    }
+    
+    if (!lua_module) {
+        LOGE("等待超时，无法找到 Lua 模块: %s", lua_lib_name.c_str());
+        return;
+    }
+    
+    const GumMemoryRange* range = gum_module_get_range(lua_module);
+    LOGI("Lua 模块已加载: %s @ 0x%lx (大小: %zu)", 
+         lua_lib_name.c_str(), range->base_address, range->size);
+    
+    // 查找 luaL_loadbufferx 导出符号
+    GumAddress loadbufferx_addr = gum_module_find_export_by_name(lua_module, "luaL_loadbufferx");
+    
+    if (!loadbufferx_addr) {
+        LOGE("未找到 luaL_loadbufferx 导出符号，尝试搜索 luaL_loadbuffer...");
+        // 尝试查找 luaL_loadbuffer (Lua 5.1 版本)
+        loadbufferx_addr = gum_module_find_export_by_name(lua_module, "luaL_loadbuffer");
+        if (!loadbufferx_addr) {
+            LOGE("未找到 luaL_loadbuffer 导出符号");
+            g_object_unref(lua_module);
+            return;
+        }
+        LOGI("✓ 找到 luaL_loadbuffer @ 0x%lx", loadbufferx_addr);
+    } else {
+        LOGI("✓ 找到 luaL_loadbufferx @ 0x%lx", loadbufferx_addr);
+    }
+    
+    // 保存原始函数指针
+    original_luaL_loadbufferx = (LuaL_loadbufferx_Func)loadbufferx_addr;
+    
+    // 使用 Interceptor Hook
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    
+    gum_interceptor_begin_transaction(interceptor);
+    GumReplaceReturn ret = gum_interceptor_replace_fast(
+        interceptor,
+        GSIZE_TO_POINTER(loadbufferx_addr),
+        (gpointer)hooked_luaL_loadbufferx,
+        (gpointer*)&original_luaL_loadbufferx
+    );
+    gum_interceptor_end_transaction(interceptor);
+    
+    if (ret == GUM_REPLACE_OK) {
+        LOGI("🎯 Lua Hook 成功: luaL_loadbufferx @ 0x%lx", loadbufferx_addr);
+    } else {
+        LOGE("❌ Lua Hook 失败: 错误码 %d", ret);
+    }
+    
+    g_object_unref(lua_module);
+}
+
 // Hook 函数分发
 void dispatchHook(GameEngine engine, GumModule* module) {
     LOGI("引擎类型: %s", getEngineName(engine));
@@ -1779,7 +2121,7 @@ void dispatchHook(GameEngine engine, GumModule* module) {
     switch (engine) {
         case GameEngine::UNITY:
             LOGI("准备 Hook Unity 加速函数...");
-            // TODO: 实现 Unity hook 逻辑
+            hookUnityTimeScale(module);
             break;
             
         case GameEngine::UNREAL:
@@ -1913,10 +2255,15 @@ void workerThread() {
     GameEngine engine = identifyGameEngine(module);
     total_timer.checkpoint("步骤7: 识别引擎完成");  // ⏱️ 检查点
     
-    // 步骤 8：分发 Hook
+    // 步骤 8：尝试lua hook
+    hookLua(libraries);
+    total_timer.checkpoint("步骤9: Lua Hook完成");  // ⏱️ 检查点
+    
+    // 步骤 9：分发 Hook
     dispatchHook(engine, module);
     total_timer.checkpoint("步骤8: Hook完成");  // ⏱️ 检查点
     
+    // 步骤 9：释放模块
     g_object_unref(module);
     LOGI("工作流程完成");
 }
